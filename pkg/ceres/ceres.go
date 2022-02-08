@@ -1,15 +1,11 @@
-/*
-	Package whisper implements Graphite's Whisper database format
-*/
+// Package ceres implements Graphite's Ceres database format
 package ceres
 
 import (
-	"encoding/binary"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"math"
 	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -18,78 +14,11 @@ import (
 	"time"
 )
 
-const (
-	IntSize         = 4
-	FloatSize       = 4
-	Float64Size     = 8
-	PointSize       = 12
-	MetadataSize    = 16
-	ArchiveInfoSize = 12
-)
-
-const (
-	Seconds = 1
-	Minutes = 60
-	Hours   = 3600
-	Days    = 86400
-	Weeks   = 86400 * 7
-	Years   = 86400 * 365
-)
-
-type AggregationMethod int
-
-const (
-	Average AggregationMethod = iota + 1
-	Sum
-	Last
-	Max
-	Min
-)
-
-var supportedAggregationMethods = []string{"average", "sum", "last", "max", "min"}
-
-var aggregationMethodToString = map[AggregationMethod]string{
-	Average: "average",
-	Sum:     "sum",
-	Last:    "last",
-	Max:     "max",
-	Min:     "min",
-}
-
-var stringToAggregationMethod = map[string]AggregationMethod{
-	"average": Average,
-	"sum":     Sum,
-	"last":    Last,
-	"max":     Max,
-	"min":     Min,
-}
-
-var errUnknownAggregatiomMethodFmt = "unknown aggregation method %v, supported %v"
-
-func (a *AggregationMethod) MarshalJSON() ([]byte, error) {
-	if s, ok := aggregationMethodToString[*a]; ok {
-		return json.Marshal(s)
-	}
-	return nil, fmt.Errorf(errUnknownAggregatiomMethodFmt, a, supportedAggregationMethods)
-}
-
-func (a *AggregationMethod) UnmarshalJSON(data []byte) error {
-	var s string
-	err := json.Unmarshal(data, &s)
-	if err != nil {
-		return err
-	}
-	var ok bool
-	*a, ok = stringToAggregationMethod[s]
-	if !ok {
-		return fmt.Errorf(errUnknownAggregatiomMethodFmt, s, supportedAggregationMethods)
-	}
-	return nil
-}
-
 type Options struct {
-	Sparse bool
-	FLock  bool
+	Sparse       bool
+	FLock        bool
+	VerboseError bool
+	TimeNow      func() time.Time
 }
 
 func unitMultiplier(s string) (int, error) {
@@ -129,15 +58,13 @@ func parseRetentionPart(retentionPart string) (int, error) {
 	return multiplier * int(value), err
 }
 
-/*
-  ParseRetentionDef parses a retention definition as you would find in the storage-schemas.conf of a Carbon install.
-  Note that this only parses a single retention definition, if you have multiple definitions (separated by a comma)
-  you will have to split them yourself.
-
-  ParseRetentionDef("10s:14d") Retention{10, 120960}
-
-  See: http://graphite.readthedocs.org/en/1.0/config-carbon.html#storage-schemas-conf
-*/
+// ParseRetentionDef parses a retention definition as you would find in the storage-schemas.conf of a Carbon installation.
+// Note that this only parses a single retention definition, if you have multiple definitions (separated by a comma)
+// you will have to split them yourself.
+//
+// ParseRetentionDef("10s:14d") Retention{10, 120960}
+//
+// See: http://graphite.readthedocs.org/en/1.0/config-carbon.html#storage-schemas-conf
 func ParseRetentionDef(retentionDef string) (*Retention, error) {
 	parts := strings.Split(retentionDef, ":")
 	if len(parts) != 2 {
@@ -150,7 +77,7 @@ func ParseRetentionDef(retentionDef string) (*Retention, error) {
 
 	points, err := parseRetentionPart(parts[1])
 	if err != nil {
-		return nil, fmt.Errorf("Failed to parse points: %v", err)
+		return nil, fmt.Errorf("Failed to parse Points: %v", err)
 	}
 	points /= precision
 
@@ -160,6 +87,12 @@ func ParseRetentionDef(retentionDef string) (*Retention, error) {
 	}, err
 }
 
+// ParseRetentionDefs parses a retention definitions as you would find in the storage-schemas.conf of a Carbon installation.
+// Note that this parses even multiple definitions
+//
+// ParseRetentionDefs("10s:1d,60s:14d") []Retention{{10, 86400}, {60, 120960}}
+//
+// See: http://graphite.readthedocs.org/en/1.0/config-carbon.html#storage-schemas-conf
 func ParseRetentionDefs(retentionDefs string) (Retentions, error) {
 	retentions := make(Retentions, 0)
 	for _, retentionDef := range strings.Split(retentionDefs, ",") {
@@ -172,12 +105,7 @@ func ParseRetentionDefs(retentionDefs string) (Retentions, error) {
 	return retentions, nil
 }
 
-/*
-  A retention level.
-
-  Retention levels describe a given archive in the database. How detailed it is and how far back
-  it records.
-*/
+// Retention levels describe a given archive in the database. How detailed it is and how far back it records.
 type Retention struct {
 	SecondsPerPoint int
 	Points          int
@@ -199,7 +127,7 @@ func (r *Retention) UnmarshalJSON(data []byte) error {
 	r.SecondsPerPoint = ret[0]
 	r.Points = ret[1]
 	if r.Points < 0 {
-		return fmt.Errorf("amount of points can't be negative: %v", r.Points)
+		return fmt.Errorf("amount of Points can't be negative: %v", r.Points)
 	}
 	if r.SecondsPerPoint < 0 {
 		return fmt.Errorf("time step can't be negative: %v", r.Points)
@@ -211,6 +139,11 @@ func (retention *Retention) MaxRetention() int {
 	return retention.SecondsPerPoint * retention.Points
 }
 
+func (retention *Retention) MaxPoints() int {
+	return retention.Points
+}
+
+// NewRetention creates a new retention structure (see description above)
 func NewRetention(secondsPerPoint, numberOfPoints int) Retention {
 	return Retention{
 		SecondsPerPoint: secondsPerPoint,
@@ -234,9 +167,7 @@ func (r retentionsByPrecision) Less(i, j int) bool {
 	return r.Retentions[i].SecondsPerPoint < r.Retentions[j].SecondsPerPoint
 }
 
-/*
-	Represents a Ceres database file.
-*/
+// Metadata represents a metadata for a Ceres database file.
 type Metadata struct {
 	AggregationMethod AggregationMethod `json:"aggregationMethod"`
 	TimeStep          int               `json:"timeStep"`
@@ -244,18 +175,13 @@ type Metadata struct {
 	Retentions        Retentions
 }
 
-type sliceInfo struct {
-	startTime int
-	step      int
-	size      int
-}
+type SliceInfo struct {
+	Filename        string
+	StartTime       int
+	SecondsPerPoint int
+	Points          int
 
-type archiveInfo struct {
-	filename        string
-	startTime       int
-	secondsPerPoint int
-
-	slices []sliceInfo
+	file *os.File
 }
 
 /*
@@ -265,7 +191,7 @@ func (archive *archiveInfo) Offset() int64 {
 
 func (archive *archiveInfo) PointOffset(baseInterval, interval int) int64 {
 	timeDistance := interval - baseInterval
-	pointDistance := timeDistance / archive.secondsPerPoint
+	pointDistance := timeDistance / archive.SecondsPerPoint
 	byteDistance := pointDistance * PointSize
 	myOffset := archive.Offset() + int64(mod(byteDistance, archive.Size()))
 
@@ -277,28 +203,18 @@ func (archive *archiveInfo) End() int64 {
 }
 
 func (archive *archiveInfo) Interval(time int) int {
-	return time - mod(time, archive.secondsPerPoint) + archive.secondsPerPoint
+	return time - mod(time, archive.SecondsPerPoint) + archive.SecondsPerPoint
 }
 */
 
 type Ceres struct {
-	file string
+	TimeNow      func() time.Time
+	file         string
+	metadataFile *os.File
 
 	// Metadata
 	metadata Metadata
-	archives []*archiveInfo
-}
-
-// Wrappers for whisper.file operations
-func (whisper *Ceres) fileWriteAt(b []byte, off int64) error {
-	_, err := whisper.file.WriteAt(b, off)
-	return err
-}
-
-// Wrappers for file.ReadAt operations
-func (whisper *Ceres) fileReadAt(b []byte, off int64) error {
-	_, err := whisper.file.ReadAt(b, off)
-	return err
+	archives map[int][]*SliceInfo
 }
 
 type CeresOption struct {
@@ -306,6 +222,7 @@ type CeresOption struct {
 	sparse   *bool
 	flock    *bool
 	metadata *Metadata
+	time     func() time.Time
 }
 
 func WithSparse() *CeresOption {
@@ -334,14 +251,8 @@ func WithMetadata(m *Metadata) *CeresOption {
 	}
 }
 
-const (
-	metadataFile = ".ceres-node"
-)
-
-/*
-	Create a new Whisper database file and write it's header.
-*/
-func Create(vaArgs ...*CeresOption) (whisper *Ceres, err error) {
+// Create a new Whisper database file and write its header.
+func Create(vaArgs ...*CeresOption) (*Ceres, error) {
 	opts := CeresOption{}
 	for _, arg := range vaArgs {
 		if arg.flock != nil {
@@ -359,6 +270,9 @@ func Create(vaArgs ...*CeresOption) (whisper *Ceres, err error) {
 		if arg.metadata != nil {
 			opts.metadata = arg.metadata
 		}
+		if arg.time != nil {
+			opts.time = arg.time
+		}
 	}
 
 	if opts.flock == nil {
@@ -369,6 +283,11 @@ func Create(vaArgs ...*CeresOption) (whisper *Ceres, err error) {
 		v := false
 		opts.sparse = &v
 	}
+	if opts.time == nil {
+		opts.time = func() time.Time {
+			return time.Now()
+		}
+	}
 
 	if opts.path == nil {
 		return nil, fmt.Errorf("path can't be empty")
@@ -378,41 +297,46 @@ func Create(vaArgs ...*CeresOption) (whisper *Ceres, err error) {
 	}
 
 	sort.Sort(retentionsByPrecision{opts.metadata.Retentions})
-	if err = validateRetentions(opts.metadata.Retentions); err != nil {
+	if err := validateRetentions(opts.metadata.Retentions); err != nil {
 		return nil, err
 	}
 
 	path := *opts.path
 
+	// For compatibility reason remove trailing `.wsp` from Filename
+	// This is required as package should look like a drop-in replacement for go-whisper in terms of API
 	idx := strings.Index(path, ".wsp")
 	if idx > 0 {
 		path = path[:idx]
 	}
 
-	file, err := os.Create(path + "/" + metadataFile)
+	metadataFile, err := os.Create(path + "/" + metadataFile)
 	if err != nil {
 		return nil, err
 	}
-	defer file.Close()
 
 	if *opts.flock {
-		if err = syscall.Flock(int(file.Fd()), syscall.LOCK_EX); err != nil {
+		if err = syscall.Flock(int(metadataFile.Fd()), syscall.LOCK_EX); err != nil {
+			_ = metadataFile.Close()
 			return nil, err
 		}
 	}
 
 	ceres := &Ceres{
-		file:     path,
-		metadata: *opts.metadata,
+		file:         path,
+		metadataFile: metadataFile,
+		metadata:     *opts.metadata,
 	}
 
 	d, err := json.Marshal(ceres.metadata)
 	if err != nil {
+		_ = metadataFile.Close()
 		return nil, err
 	}
 
-	_, err = file.Write(d)
+	_, err = metadataFile.Write(d)
 	if err != nil {
+		_ = metadataFile.Close()
 		return nil, err
 	}
 	return ceres, nil
@@ -428,147 +352,164 @@ func validateRetentions(retentions Retentions) error {
 		}
 
 		nextRetention := retentions[i+1]
-		if !(retention.secondsPerPoint < nextRetention.secondsPerPoint) {
-			return fmt.Errorf("A Whisper database may not be configured having two archives with the same precision (archive%v: %v, archive%v: %v)", i, retention, i+1, nextRetention)
+		if !(retention.SecondsPerPoint < nextRetention.SecondsPerPoint) {
+			return fmt.Errorf("ceres database may not be configured having two archives with the same precision (archive%v: %v, archive%v: %v)", i, retention, i+1, nextRetention)
 		}
 
-		if mod(nextRetention.secondsPerPoint, retention.secondsPerPoint) != 0 {
-			return fmt.Errorf("Higher precision archives' precision must evenly divide all lower precision archives' precision (archive%v: %v, archive%v: %v)", i, retention.secondsPerPoint, i+1, nextRetention.secondsPerPoint)
+		if mod(nextRetention.SecondsPerPoint, retention.SecondsPerPoint) != 0 {
+			return fmt.Errorf("higher precision archives' precision must evenly divide all lower precision archives' precision (archive%v: %v, archive%v: %v)", i, retention.SecondsPerPoint, i+1, nextRetention.SecondsPerPoint)
 		}
 
 		if retention.MaxRetention() >= nextRetention.MaxRetention() {
-			return fmt.Errorf("Lower precision archives must cover larger time intervals than higher precision archives (archive%v: %v seconds, archive%v: %v seconds)", i, retention.MaxRetention(), i+1, nextRetention.MaxRetention())
-		}
-
-		if retention.numberOfPoints < (nextRetention.secondsPerPoint / retention.secondsPerPoint) {
-			return fmt.Errorf("Each archive must have at least enough points to consolidate to the next archive (archive%v consolidates %v of archive%v's points but it has only %v total points)", i+1, nextRetention.secondsPerPoint/retention.secondsPerPoint, i, retention.numberOfPoints)
+			return fmt.Errorf("lower precision archives must cover larger time intervals than higher precision archives (archive%v: %v seconds, archive%v: %v seconds)", i, retention.MaxRetention(), i+1, nextRetention.MaxRetention())
 		}
 	}
 	return nil
 }
 
-/*
-  Open an existing Whisper database and read it's header
-*/
-func Open(path string) (whisper *Ceres, err error) {
+// Open an existing Whisper database and read it's header
+func Open(path string) (*Ceres, error) {
 	return OpenWithOptions(path, &Options{
 		FLock: false,
 	})
 }
 
-func OpenWithOptions(path string, options *Options) (whisper *Ceres, err error) {
-	file, err := os.OpenFile(path, os.O_RDWR, 0666)
+func OpenWithOptions(path string, options *Options) (*Ceres, error) {
+	metadataPath := filepath.Clean(path + "/" + metadataFile)
+	metadataFile, err := os.OpenFile(metadataPath, os.O_RDWR, 0666)
 	if err != nil {
-		return
+		return nil, err
 	}
-
-	defer func() {
-		if err != nil {
-			whisper = nil
-			file.Close()
-		}
-	}()
 
 	if options.FLock {
-		if err = syscall.Flock(int(file.Fd()), syscall.LOCK_EX); err != nil {
-			return
+		if err = syscall.Flock(int(metadataFile.Fd()), syscall.LOCK_EX); err != nil {
+			_ = metadataFile.Close()
+			return nil, err
 		}
 	}
 
-	whisper = new(Ceres)
-	whisper.file = file
-
-	offset := 0
-
-	// read the metadata
-	b := make([]byte, MetadataSize)
-	readed, err := file.Read(b)
-
-	if err != nil {
-		err = fmt.Errorf("Unable to read header: %s", err.Error())
-		return
-	}
-	if readed != MetadataSize {
-		err = fmt.Errorf("Unable to read header: EOF")
-		return
+	ceres := Ceres{
+		file:         filepath.Clean(path),
+		metadataFile: metadataFile,
 	}
 
-	a := unpackInt(b[offset : offset+IntSize])
-	if a > 1024 { // support very old format. File starts with lastUpdate and has only average aggregation method
-		whisper.aggregationMethod = Average
+	if options.TimeNow != nil {
+		ceres.TimeNow = options.TimeNow
 	} else {
-		whisper.aggregationMethod = AggregationMethod(a)
-	}
-	offset += IntSize
-	whisper.maxRetention = unpackInt(b[offset : offset+IntSize])
-	offset += IntSize
-	whisper.xFilesFactor = unpackFloat32(b[offset : offset+FloatSize])
-	offset += FloatSize
-	archiveCount := unpackInt(b[offset : offset+IntSize])
-	offset += IntSize
-
-	// read the archive info
-	b = make([]byte, ArchiveInfoSize)
-
-	whisper.archives = make([]*archiveInfo, 0)
-	for i := 0; i < archiveCount; i++ {
-		readed, err = file.Read(b)
-		if err != nil || readed != ArchiveInfoSize {
-			err = fmt.Errorf("Unable to read archive %d metadata", i)
-			return
+		ceres.TimeNow = func() time.Time {
+			return time.Now()
 		}
-		whisper.archives = append(whisper.archives, unpackArchiveInfo(b))
 	}
 
-	return whisper, nil
-}
-
-func (whisper *Ceres) writeHeader() (err error) {
-	b := make([]byte, whisper.MetadataSize())
-	i := 0
-	i += packInt(b, int(whisper.aggregationMethod), i)
-	i += packInt(b, whisper.maxRetention, i)
-	i += packFloat32(b, whisper.xFilesFactor, i)
-	i += packInt(b, len(whisper.archives), i)
-	for _, archive := range whisper.archives {
-		i += packInt(b, archive.offset, i)
-		i += packInt(b, archive.secondsPerPoint, i)
-		i += packInt(b, archive.numberOfPoints, i)
+	metadataDecoder := json.NewDecoder(metadataFile)
+	err = metadataDecoder.Decode(&ceres.metadata)
+	if err != nil {
+		_ = metadataFile.Close()
+		return nil, err
 	}
-	_, err = whisper.file.Write(b)
 
-	return err
-}
-
-/*
-  Close the whisper file
-*/
-func (whisper *Ceres) Close() {
-	whisper.file.Close()
-}
-
-/*
-  Calculate the total number of bytes the Whisper file should be according to the metadata.
-*/
-func (whisper *Ceres) Size() int {
-	size := whisper.MetadataSize()
-	for _, archive := range whisper.archives {
-		size += archive.Size()
+	slices, err := filepath.Glob(ceres.file + "/*.slice")
+	if err != nil {
+		_ = metadataFile.Close()
+		return nil, err
 	}
-	return size
+
+	ceres.archives = make(map[int][]*SliceInfo)
+	for _, slice := range slices {
+		stat, err := os.Stat(slice)
+		if err != nil {
+			if options.VerboseError {
+				fmt.Printf("error getting information about slice '%v': %v", slice, err)
+			}
+			continue
+		}
+		name := filepath.Base(slice[:len(slice)-len(".slice")])
+		parts := strings.Split(name, "@")
+		if len(parts) != 2 {
+			if options.VerboseError {
+				fmt.Printf("file '%v' is malformed, expected format: 'StartTime@retention.slice', got: '%v'", name+".slice", parts)
+			}
+			// Ignoring file with broken file name
+			continue
+		}
+		step, err := strconv.ParseInt(parts[1], 10, 64)
+		if err != nil {
+			if options.VerboseError {
+				fmt.Printf("failed to parse step '%v' as integer: %v", parts[1], err)
+			}
+			// Ignoring file with broken file name
+			continue
+		}
+		startTime, err := strconv.ParseInt(parts[0], 10, 64)
+		if err != nil {
+			if options.VerboseError {
+				fmt.Printf("failed to parse StartTime '%v' as integer: %v", parts[0], err)
+			}
+			// Ignoring file with broken file name
+			continue
+		}
+		info := SliceInfo{
+			Filename:        slice,
+			StartTime:       int(startTime),
+			SecondsPerPoint: int(step),
+			Points:          int(stat.Size() / PointSize),
+		}
+		_, ok := ceres.archives[int(step)]
+		if ok {
+			ceres.archives[int(step)] = append(ceres.archives[int(step)], &info)
+			continue
+		}
+		ceres.archives[int(step)] = []*SliceInfo{&info}
+	}
+
+	return &ceres, nil
 }
 
-/*
-  Calculate the number of bytes the metadata section will be.
-*/
-func (whisper *Ceres) MetadataSize() int {
-	return MetadataSize + (ArchiveInfoSize * len(whisper.archives))
+// Close the ceres file
+func (ceres *Ceres) Close() {
+	_ = ceres.metadataFile.Close()
 }
 
-/* Return aggregation method */
-func (whisper *Ceres) AggregationMethod() string {
+// ArchiveCount returns total amount of retentions found
+func (ceres *Ceres) ArchiveCount() int {
+	return len(ceres.archives)
+}
+
+// ArchivesInfo returns information about archives
+func (ceres *Ceres) ArchivesInfo() map[int][]*SliceInfo {
+	return ceres.archives
+}
+
+// Size calculates total number of bytes the Ceres file should be according to the metadata.
+func (ceres *Ceres) Size() (int, error) {
+	size, err := ceres.MetadataSize()
+	if err != nil {
+		return 0, err
+	}
+	for _, archive := range ceres.archives {
+		for _, slice := range archive {
+			size += slice.Points * PointSize
+		}
+	}
+	return size, nil
+}
+
+// MetadataSize -  returns size of metadata file
+func (ceres *Ceres) MetadataSize() (int, error) {
+	if ceres.metadataFile == nil {
+		return -1, fmt.Errorf("metadata file is not defined, this shouldn't happen")
+	}
+	stat, err := ceres.metadataFile.Stat()
+	if err != nil {
+		return 0, err
+	}
+	return int(stat.Size()), nil
+}
+
+// AggregationMethod - returns string representation of aggregation method
+func (ceres *Ceres) AggregationMethod() string {
 	aggr := "unknown"
-	switch whisper.aggregationMethod {
+	switch ceres.metadata.AggregationMethod {
 	case Average:
 		aggr = "Average"
 	case Sum:
@@ -583,32 +524,31 @@ func (whisper *Ceres) AggregationMethod() string {
 	return aggr
 }
 
-/* Return max retention in seconds */
-func (whisper *Ceres) MaxRetention() int {
-	return whisper.maxRetention
+// MaxRetention - returns max retnetion in seconds
+func (ceres *Ceres) MaxRetention() int {
+	return ceres.metadata.Retentions[0].MaxRetention()
 }
 
-/* Return xFilesFactor */
-func (whisper *Ceres) XFilesFactor() float32 {
-	return whisper.xFilesFactor
+// StartTime - calculate the starting time for a whisper db.
+func (ceres *Ceres) StartTime() int {
+	now := int(ceres.TimeNow().Unix()) // TODO: danger of 2030 something overflow
+	return now - ceres.MaxRetention()
 }
 
-/* Return retentions */
-func (whisper *Ceres) Retentions() []Retention {
-	ret := make([]Retention, 0, 4)
-	for _, archive := range whisper.archives {
-		ret = append(ret, archive.Retention)
-	}
+// XFilesFactor returns configured xFilesFactor from metadata
+func (ceres *Ceres) XFilesFactor() float32 {
+	return ceres.metadata.XFilesFactor
+}
 
-	return ret
+// Retentions - returns list of retentions for specific path
+func (ceres *Ceres) Retentions() []Retention {
+	return ceres.metadata.Retentions
 }
 
 /*
-  Update a value in the database.
-
-  If the timestamp is in the future or outside of the maximum retention it will
-  fail immediately.
-*/
+// Update a value in the database.
+// If the timestamp is in the future or outside of the maximum retention it will
+// fail immediately.
 func (whisper *Ceres) Update(value float64, timestamp int) (err error) {
 	// recover panics and return as error
 	defer func() {
@@ -618,7 +558,7 @@ func (whisper *Ceres) Update(value float64, timestamp int) (err error) {
 	}()
 
 	diff := int(time.Now().Unix()) - timestamp
-	if !(diff < whisper.maxRetention && diff >= 0) {
+	if !(diff < whisper.MaxRetention() && diff >= 0) {
 		return fmt.Errorf("Timestamp not covered by any archives in this database")
 	}
 	var archive *archiveInfo
@@ -632,7 +572,7 @@ func (whisper *Ceres) Update(value float64, timestamp int) (err error) {
 		break
 	}
 
-	myInterval := timestamp - mod(timestamp, archive.secondsPerPoint)
+	myInterval := timestamp - mod(timestamp, archive.SecondsPerPoint)
 	point := dataPoint{myInterval, value}
 
 	_, err = whisper.file.WriteAt(point.Bytes(), whisper.getPointOffset(myInterval, archive))
@@ -654,16 +594,16 @@ func (whisper *Ceres) Update(value float64, timestamp int) (err error) {
 	return nil
 }
 
-func reversePoints(points []*TimeSeriesPoint) {
-	size := len(points)
+func reversePoints(Points []*TimeSeriesPoint) {
+	size := len(Points)
 	end := size / 2
 
 	for i := 0; i < end; i++ {
-		points[i], points[size-i-1] = points[size-i-1], points[i]
+		Points[i], Points[size-i-1] = Points[size-i-1], Points[i]
 	}
 }
 
-func (whisper *Ceres) UpdateMany(points []*TimeSeriesPoint) (err error) {
+func (whisper *Ceres) UpdateMany(Points []*TimeSeriesPoint) (err error) {
 	// recover panics and return as error
 	defer func() {
 		if e := recover(); e != nil {
@@ -671,15 +611,15 @@ func (whisper *Ceres) UpdateMany(points []*TimeSeriesPoint) (err error) {
 		}
 	}()
 
-	// sort the points, newest first
-	reversePoints(points)
-	sort.Stable(timeSeriesPointsNewestFirst{points})
+	// sort the Points, newest first
+	reversePoints(Points)
+	sort.Stable(timeSeriesPointsNewestFirst{Points})
 
 	now := int(time.Now().Unix()) // TODO: danger of 2030 something overflow
 
 	var currentPoints []*TimeSeriesPoint
 	for _, archive := range whisper.archives {
-		currentPoints, points = extractPoints(points, now, archive.MaxRetention())
+		currentPoints, Points = extractPoints(Points, now, archive.MaxRetention())
 		if len(currentPoints) == 0 {
 			continue
 		}
@@ -690,15 +630,15 @@ func (whisper *Ceres) UpdateMany(points []*TimeSeriesPoint) (err error) {
 			return
 		}
 
-		if len(points) == 0 { // nothing left to do
+		if len(Points) == 0 { // nothing left to do
 			break
 		}
 	}
 	return
 }
 
-func (whisper *Ceres) archiveUpdateMany(archive *archiveInfo, points []*TimeSeriesPoint) error {
-	alignedPoints := alignPoints(archive, points)
+func (whisper *Ceres) archiveUpdateMany(archive *archiveInfo, Points []*TimeSeriesPoint) error {
+	alignedPoints := alignPoints(archive, Points)
 	intervals, packedBlocks := packSequences(archive, alignedPoints)
 
 	baseInterval := whisper.getBaseInterval(archive)
@@ -734,7 +674,7 @@ func (whisper *Ceres) archiveUpdateMany(archive *archiveInfo, points []*TimeSeri
 		seen := make(map[int]bool)
 		propagateFurther := false
 		for _, point := range alignedPoints {
-			interval := point.interval - mod(point.interval, lower.secondsPerPoint)
+			interval := point.interval - mod(point.interval, lower.SecondsPerPoint)
 			if !seen[interval] {
 				if propagated, err := whisper.propagate(interval, higher, lower); err != nil {
 					panic("Failed to propagate")
@@ -751,25 +691,25 @@ func (whisper *Ceres) archiveUpdateMany(archive *archiveInfo, points []*TimeSeri
 	return nil
 }
 
-func extractPoints(points []*TimeSeriesPoint, now int, maxRetention int) (currentPoints []*TimeSeriesPoint, remainingPoints []*TimeSeriesPoint) {
+func extractPoints(Points []*TimeSeriesPoint, now int, maxRetention int) (currentPoints []*TimeSeriesPoint, remainingPoints []*TimeSeriesPoint) {
 	maxAge := now - maxRetention
-	for i, point := range points {
+	for i, point := range Points {
 		if point.Time < maxAge {
 			if i > 0 {
-				return points[:i-1], points[i-1:]
+				return Points[:i-1], Points[i-1:]
 			} else {
-				return []*TimeSeriesPoint{}, points
+				return []*TimeSeriesPoint{}, Points
 			}
 		}
 	}
-	return points, remainingPoints
+	return Points, remainingPoints
 }
 
-func alignPoints(archive *archiveInfo, points []*TimeSeriesPoint) []dataPoint {
-	alignedPoints := make([]dataPoint, 0, len(points))
+func alignPoints(archive *archiveInfo, Points []*TimeSeriesPoint) []dataPoint {
+	alignedPoints := make([]dataPoint, 0, len(Points))
 	positions := make(map[int]int)
-	for _, point := range points {
-		dPoint := dataPoint{point.Time - mod(point.Time, archive.secondsPerPoint), point.Value}
+	for _, point := range Points {
+		dPoint := dataPoint{point.Time - mod(point.Time, archive.SecondsPerPoint), point.Value}
 		if p, ok := positions[dPoint.interval]; ok {
 			alignedPoints[p] = dPoint
 		} else {
@@ -780,11 +720,11 @@ func alignPoints(archive *archiveInfo, points []*TimeSeriesPoint) []dataPoint {
 	return alignedPoints
 }
 
-func packSequences(archive *archiveInfo, points []dataPoint) (intervals []int, packedBlocks [][]byte) {
+func packSequences(archive *archiveInfo, Points []dataPoint) (intervals []int, packedBlocks [][]byte) {
 	intervals = make([]int, 0)
 	packedBlocks = make([][]byte, 0)
-	for i, point := range points {
-		if i == 0 || point.interval != intervals[len(intervals)-1]+archive.secondsPerPoint {
+	for i, point := range Points {
+		if i == 0 || point.interval != intervals[len(intervals)-1]+archive.SecondsPerPoint {
 			intervals = append(intervals, point.interval)
 			packedBlocks = append(packedBlocks, point.Bytes())
 		} else {
@@ -794,11 +734,7 @@ func packSequences(archive *archiveInfo, points []dataPoint) (intervals []int, p
 	return
 }
 
-/*
-	Calculate the offset for a given interval in an archive
-
-	This method retrieves the baseInterval and the
-*/
+// getPointOffset - calculate the offset for a given interval in an archive
 func (whisper *Ceres) getPointOffset(start int, archive *archiveInfo) int64 {
 	baseInterval := whisper.getBaseInterval(archive)
 	if baseInterval == 0 {
@@ -817,7 +753,7 @@ func (whisper *Ceres) getBaseInterval(archive *archiveInfo) int {
 
 func (whisper *Ceres) lowerArchives(archive *archiveInfo) (lowerArchives []*archiveInfo) {
 	for i, lower := range whisper.archives {
-		if lower.secondsPerPoint > archive.secondsPerPoint {
+		if lower.SecondsPerPoint > archive.SecondsPerPoint {
 			return whisper.archives[i:]
 		}
 	}
@@ -825,12 +761,12 @@ func (whisper *Ceres) lowerArchives(archive *archiveInfo) (lowerArchives []*arch
 }
 
 func (whisper *Ceres) propagate(timestamp int, higher, lower *archiveInfo) (bool, error) {
-	lowerIntervalStart := timestamp - mod(timestamp, lower.secondsPerPoint)
+	lowerIntervalStart := timestamp - mod(timestamp, lower.SecondsPerPoint)
 
 	higherFirstOffset := whisper.getPointOffset(lowerIntervalStart, higher)
 
 	// TODO: extract all this series extraction stuff
-	higherPoints := lower.secondsPerPoint / higher.secondsPerPoint
+	higherPoints := lower.SecondsPerPoint / higher.SecondsPerPoint
 	higherSize := higherPoints * PointSize
 	relativeFirstOffset := higherFirstOffset - higher.Offset()
 	relativeLastOffset := int64(mod(int(relativeFirstOffset+int64(higherSize)), higher.Size()))
@@ -849,15 +785,15 @@ func (whisper *Ceres) propagate(timestamp int, higher, lower *archiveInfo) (bool
 		if dPoint.interval == currentInterval {
 			knownValues = append(knownValues, dPoint.value)
 		}
-		currentInterval += higher.secondsPerPoint
+		currentInterval += higher.SecondsPerPoint
 	}
 
-	// propagate aggregateValue to propagate from neighborValues if we have enough known points
+	// propagate aggregateValue to propagate from neighborValues if we have enough known Points
 	if len(knownValues) == 0 {
 		return false, nil
 	}
 	knownPercent := float32(len(knownValues)) / float32(len(series))
-	if knownPercent < whisper.xFilesFactor { // check we have enough data points to propagate a value
+	if knownPercent < whisper.xFilesFactor { // check we have enough data Points to propagate a value
 		return false, nil
 	} else {
 		aggregateValue := aggregate(whisper.aggregationMethod, knownValues)
@@ -932,17 +868,7 @@ func (whisper *Ceres) checkSeriesEmptyAt(start, len int64, fromTime, untilTime i
 	return true, nil
 }
 
-/*
-  Calculate the starting time for a whisper db.
-*/
-func (whisper *Ceres) StartTime() int {
-	now := int(time.Now().Unix()) // TODO: danger of 2030 something overflow
-	return now - whisper.maxRetention
-}
-
-/*
-  Fetch a TimeSeries for a given time span from the file.
-*/
+// Fetch a TimeSeries for a given time span from the file.
 func (whisper *Ceres) Fetch(fromTime, untilTime int) (timeSeries *TimeSeries, err error) {
 	now := int(time.Now().Unix()) // TODO: danger of 2030 something overflow
 	if fromTime > untilTime {
@@ -978,9 +904,9 @@ func (whisper *Ceres) Fetch(fromTime, untilTime int) (timeSeries *TimeSeries, er
 	baseInterval := whisper.getBaseInterval(archive)
 
 	if baseInterval == 0 {
-		step := archive.secondsPerPoint
-		points := (untilInterval - fromInterval) / step
-		values := make([]float64, points)
+		step := archive.SecondsPerPoint
+		Points := (untilInterval - fromInterval) / step
+		values := make([]float64, Points)
 		for i := range values {
 			values[i] = math.NaN()
 		}
@@ -1005,7 +931,7 @@ func (whisper *Ceres) Fetch(fromTime, untilTime int) (timeSeries *TimeSeries, er
 		values[i] = math.NaN()
 	}
 	currentInterval := fromInterval
-	step := archive.secondsPerPoint
+	step := archive.SecondsPerPoint
 
 	for i, dPoint := range series {
 		if dPoint.interval == currentInterval {
@@ -1017,9 +943,7 @@ func (whisper *Ceres) Fetch(fromTime, untilTime int) (timeSeries *TimeSeries, er
 	return &TimeSeries{fromInterval, untilInterval, step, values}, nil
 }
 
-/*
-  Check a TimeSeries has a points for a given time span from the file.
-*/
+// CheckEmpty - checks if TimeSeries have a Points for a given time span from the file.
 func (whisper *Ceres) CheckEmpty(fromTime, untilTime int) (exist bool, err error) {
 	now := int(time.Now().Unix()) // TODO: danger of 2030 something overflow
 	if fromTime > untilTime {
@@ -1107,11 +1031,11 @@ func (ts *TimeSeries) Values() []float64 {
 }
 
 func (ts *TimeSeries) Points() []TimeSeriesPoint {
-	points := make([]TimeSeriesPoint, len(ts.values))
+	Points := make([]TimeSeriesPoint, len(ts.values))
 	for i, value := range ts.values {
-		points[i] = TimeSeriesPoint{Time: ts.fromTime + ts.step*i, Value: value}
+		Points[i] = TimeSeriesPoint{Time: ts.fromTime + ts.step*i, Value: value}
 	}
-	return points
+	return Points
 }
 
 func (ts *TimeSeries) String() string {
@@ -1231,11 +1155,4 @@ func unpackDataPoints(b []byte) (series []dataPoint) {
 	}
 	return
 }
-
-/*
-	Implementation of modulo that works like Python
-	Thanks @timmow for this
 */
-func mod(a, b int) int {
-	return a - (b * int(math.Floor(float64(a)/float64(b))))
-}
