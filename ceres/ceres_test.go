@@ -2,6 +2,7 @@ package ceres
 
 import (
 	"encoding/binary"
+	"errors"
 	"math"
 	"testing"
 )
@@ -188,6 +189,20 @@ func TestSliceRead(t *testing.T) {
 			expectedErr:    nil,
 			expectedResult: []float64{8, 2},
 		},
+		{
+			testName:  "no data, error",
+			startTime: 1,
+			sliceStep: 1,
+			values:    []float64{8, 4, 2, 0},
+
+			readFrom:           5,
+			readUntil:          4,
+			requestStep:        2,
+			aggregationMethond: Max,
+
+			expectedErr:    ErrInvalidFrom,
+			expectedResult: []float64{},
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.testName, func(t *testing.T) {
@@ -201,7 +216,7 @@ func TestSliceRead(t *testing.T) {
 				content: floatSliceToBytes(test.values),
 			}
 			res, err := slice.readSlice(r, test.readFrom, test.readUntil, test.requestStep, test.aggregationMethond)
-			if err != test.expectedErr {
+			if !errors.Is(err, test.expectedErr) {
 				t.Errorf("unexpected err, got %+v, expected %+v", test.expectedErr, err)
 			}
 			if len(res) != len(test.expectedResult) {

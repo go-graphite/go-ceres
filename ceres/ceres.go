@@ -206,7 +206,13 @@ func (slice *CeresSlice) getReader() io.ReaderAt {
 }
 
 func (slice *CeresSlice) Read(from, until, step int64, method AggregationMethod) ([]float64, error) {
-	return slice.readSlice(slice.getReader(), from, until, step, method)
+	val, err := slice.readSlice(slice.getReader(), from, until, step, method)
+	// We don't want to have too many file descriptors open
+	if slice.file != nil {
+		_ = slice.file.Close()
+		slice.file = nil
+	}
+	return val, err
 }
 
 func (slice *CeresSlice) readSlice(reader io.ReaderAt, from, until, step int64, aggregationMethod AggregationMethod) ([]float64, error) {
@@ -551,6 +557,13 @@ func OpenWithOptions(path string, options *Options) (*Ceres, error) {
 // Close the ceres file
 func (ceres *Ceres) Close() {
 	_ = ceres.metadataFile.Close()
+	for _, archives := range ceres.archives {
+		for _, archive := range archives {
+			if archive.file != nil {
+				_ = archive.file.Close()
+			}
+		}
+	}
 }
 
 // ArchiveCount returns total amount of retentions found

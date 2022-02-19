@@ -6,4 +6,4 @@ Aimed to be as compatible as possible with go-whisper.
 Status
 =====
 
-Not working. Just a draft of API
+Not suitable for Production (See TODO for current state of implemented features)
