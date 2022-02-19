@@ -52,9 +52,20 @@ func main() {
 		c.MaxRetention(),
 		size,
 		c.XFilesFactor(),
-		c.AggregationMethod(),
+		c.AggregationMethodString(),
 		c.StartTime(),
 		c.Retentions(),
 		archives,
 	)
+
+	for _, archive := range archives {
+		for _, slice := range archive {
+			vals, err := slice.Read(slice.StartTime, slice.StartTime+slice.SecondsPerPoint*slice.Points, slice.SecondsPerPoint, c.AggregationMethod())
+			if err != nil {
+				log.Printf("step=%v, slice=%v, err=%v", slice.SecondsPerPoint, slice.Filename, err)
+				continue
+			}
+			log.Printf("step=%v, slice=%v, values=%+v", slice.SecondsPerPoint, slice.Filename, vals)
+		}
+	}
 }

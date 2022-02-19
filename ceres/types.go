@@ -35,6 +35,14 @@ var stringToAggregationMethod = map[string]AggregationMethod{
 	"min":     Min,
 }
 
+// AggregationMethod - returns string representation of aggregation method
+func (a AggregationMethod) String() string {
+	if m, ok := aggregationMethodToString[a]; ok {
+		return m
+	}
+	return "unknown"
+}
+
 func (a *AggregationMethod) MarshalJSON() ([]byte, error) {
 	if s, ok := aggregationMethodToString[*a]; ok {
 		return json.Marshal(s)

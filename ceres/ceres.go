@@ -3,7 +3,9 @@ package ceres
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -21,7 +23,7 @@ type Options struct {
 	TimeNow      func() time.Time
 }
 
-func unitMultiplier(s string) (int, error) {
+func unitMultiplier(s string) (int64, error) {
 	switch {
 	case strings.HasPrefix(s, "s"):
 		return Seconds, nil
@@ -36,15 +38,15 @@ func unitMultiplier(s string) (int, error) {
 	case strings.HasPrefix(s, "y"):
 		return Years, nil
 	}
-	return 0, fmt.Errorf("Invalid unit multiplier [%v]", s)
+	return 0, fmt.Errorf("invalid unit multiplier [%v]", s)
 }
 
 var retentionRegexp *regexp.Regexp = regexp.MustCompile("^(\\d+)([smhdwy]+)$")
 
-func parseRetentionPart(retentionPart string) (int, error) {
+func parseRetentionPart(retentionPart string) (int64, error) {
 	part, err := strconv.ParseInt(retentionPart, 10, 32)
 	if err == nil {
-		return int(part), nil
+		return part, nil
 	}
 	if !retentionRegexp.MatchString(retentionPart) {
 		return 0, fmt.Errorf("%v", retentionPart)
@@ -55,7 +57,7 @@ func parseRetentionPart(retentionPart string) (int, error) {
 		panic(fmt.Sprintf("Regex on %v is borked, %v cannot be parsed as int", retentionPart, matches[1]))
 	}
 	multiplier, err := unitMultiplier(matches[2])
-	return multiplier * int(value), err
+	return multiplier * value, err
 }
 
 // ParseRetentionDef parses a retention definition as you would find in the storage-schemas.conf of a Carbon installation.
@@ -107,44 +109,44 @@ func ParseRetentionDefs(retentionDefs string) (Retentions, error) {
 
 // Retention levels describe a given archive in the database. How detailed it is and how far back it records.
 type Retention struct {
-	SecondsPerPoint int
-	Points          int
+	SecondsPerPoint int64
+	Points          int64
 }
 
-func (r *Retention) MarshalJSON() ([]byte, error) {
-	var ret [2]int
-	ret[0] = r.SecondsPerPoint
-	ret[1] = r.Points
+func (retention *Retention) MarshalJSON() ([]byte, error) {
+	var ret [2]int64
+	ret[0] = retention.SecondsPerPoint
+	ret[1] = retention.Points
 	return json.Marshal(ret)
 }
 
-func (r *Retention) UnmarshalJSON(data []byte) error {
-	var ret [2]int
+func (retention *Retention) UnmarshalJSON(data []byte) error {
+	var ret [2]int64
 	err := json.Unmarshal(data, &ret)
 	if err != nil {
 		return err
 	}
-	r.SecondsPerPoint = ret[0]
-	r.Points = ret[1]
-	if r.Points < 0 {
-		return fmt.Errorf("amount of Points can't be negative: %v", r.Points)
+	retention.SecondsPerPoint = ret[0]
+	retention.Points = ret[1]
+	if retention.Points < 0 {
+		return fmt.Errorf("amount of Points can't be negative: %v", retention.Points)
 	}
-	if r.SecondsPerPoint < 0 {
-		return fmt.Errorf("time step can't be negative: %v", r.Points)
+	if retention.SecondsPerPoint < 0 {
+		return fmt.Errorf("time step can't be negative: %v", retention.Points)
 	}
 	return nil
 }
 
-func (retention *Retention) MaxRetention() int {
-	return retention.SecondsPerPoint * retention.Points
+func (retention *Retention) MaxRetention() int64 {
+	return int64(retention.SecondsPerPoint) * int64(retention.Points)
 }
 
-func (retention *Retention) MaxPoints() int {
+func (retention *Retention) MaxPoints() int64 {
 	return retention.Points
 }
 
 // NewRetention creates a new retention structure (see description above)
-func NewRetention(secondsPerPoint, numberOfPoints int) Retention {
+func NewRetention(secondsPerPoint, numberOfPoints int64) Retention {
 	return Retention{
 		SecondsPerPoint: secondsPerPoint,
 		Points:          numberOfPoints,
@@ -175,13 +177,94 @@ type Metadata struct {
 	Retentions        Retentions
 }
 
-type SliceInfo struct {
+type CeresSlice struct {
 	Filename        string
-	StartTime       int
-	SecondsPerPoint int
-	Points          int
+	StartTime       int64
+	SecondsPerPoint int64
+	Points          int64
 
 	file *os.File
+}
+
+func (slice *CeresSlice) MaxRetention() int64 {
+	return slice.StartTime + slice.SecondsPerPoint*slice.Points
+}
+
+func (slice *CeresSlice) MinRetention() int64 {
+	return slice.StartTime
+}
+
+func (slice *CeresSlice) Step() int64 {
+	return slice.SecondsPerPoint
+}
+
+func (slice *CeresSlice) getReader() io.ReaderAt {
+	if slice.file == nil {
+		slice.file, _ = os.Open(slice.Filename)
+	}
+	return slice.file
+}
+
+func (slice *CeresSlice) Read(from, until, step int64, method AggregationMethod) ([]float64, error) {
+	return slice.readSlice(slice.getReader(), from, until, step, method)
+}
+
+func (slice *CeresSlice) readSlice(reader io.ReaderAt, from, until, step int64, aggregationMethod AggregationMethod) ([]float64, error) {
+	if from < slice.StartTime {
+		from = slice.StartTime
+	}
+	if until > slice.MaxRetention() {
+		until = slice.MaxRetention()
+	}
+	if step == -1 {
+		step = slice.SecondsPerPoint
+	}
+	if until < from {
+		return nil, ErrInvalidFrom
+	}
+
+	fromRead := from - mod(from, slice.SecondsPerPoint)
+	untilRead := until - mod(until, slice.SecondsPerPoint)
+	fromResult := from - mod(from, step)
+	untilResult := until - mod(until, step)
+	res := make([]float64, (untilResult-fromResult+1)/step)
+	readBuffer := make([]byte, PointSize*(untilRead-fromRead+1)/slice.SecondsPerPoint)
+	stepConversionRatio := step / slice.SecondsPerPoint
+	aggregationBuffer := make([]float64, stepConversionRatio)
+
+	offset := fromRead - slice.StartTime
+	_, err := reader.ReadAt(readBuffer, offset)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return nil, err
+	}
+	begin := int64(0)
+	resultIdx := 0
+	if stepConversionRatio == 1 {
+		for {
+			end := begin + Float64Size
+			if end > int64(len(readBuffer)) {
+				break
+			}
+			res[resultIdx] = unpackFloat64(readBuffer[begin:end])
+			resultIdx++
+			begin = end
+		}
+	} else {
+		for {
+			end := begin + stepConversionRatio*Float64Size
+			if end > int64(len(readBuffer)) {
+				break
+			}
+			for i := int64(0); i < stepConversionRatio; i++ {
+				aggregationBuffer[i] = unpackFloat64(readBuffer[begin+i*Float64Size : begin+i*Float64Size+Float64Size])
+			}
+			res[resultIdx] = aggregate(aggregationMethod, aggregationBuffer)
+			resultIdx++
+			begin = end
+		}
+	}
+
+	return res, nil
 }
 
 /*
@@ -214,7 +297,7 @@ type Ceres struct {
 
 	// Metadata
 	metadata Metadata
-	archives map[int][]*SliceInfo
+	archives map[int][]*CeresSlice
 }
 
 type CeresOption struct {
@@ -414,7 +497,7 @@ func OpenWithOptions(path string, options *Options) (*Ceres, error) {
 		return nil, err
 	}
 
-	ceres.archives = make(map[int][]*SliceInfo)
+	ceres.archives = make(map[int][]*CeresSlice)
 	for _, slice := range slices {
 		stat, err := os.Stat(slice)
 		if err != nil {
@@ -448,18 +531,18 @@ func OpenWithOptions(path string, options *Options) (*Ceres, error) {
 			// Ignoring file with broken file name
 			continue
 		}
-		info := SliceInfo{
+		info := CeresSlice{
 			Filename:        slice,
-			StartTime:       int(startTime),
-			SecondsPerPoint: int(step),
-			Points:          int(stat.Size() / PointSize),
+			StartTime:       startTime,
+			SecondsPerPoint: step,
+			Points:          stat.Size() / PointSize,
 		}
 		_, ok := ceres.archives[int(step)]
 		if ok {
 			ceres.archives[int(step)] = append(ceres.archives[int(step)], &info)
 			continue
 		}
-		ceres.archives[int(step)] = []*SliceInfo{&info}
+		ceres.archives[int(step)] = []*CeresSlice{&info}
 	}
 
 	return &ceres, nil
@@ -476,12 +559,12 @@ func (ceres *Ceres) ArchiveCount() int {
 }
 
 // ArchivesInfo returns information about archives
-func (ceres *Ceres) ArchivesInfo() map[int][]*SliceInfo {
+func (ceres *Ceres) ArchivesInfo() map[int][]*CeresSlice {
 	return ceres.archives
 }
 
 // Size calculates total number of bytes the Ceres file should be according to the metadata.
-func (ceres *Ceres) Size() (int, error) {
+func (ceres *Ceres) Size() (int64, error) {
 	size, err := ceres.MetadataSize()
 	if err != nil {
 		return 0, err
@@ -495,7 +578,7 @@ func (ceres *Ceres) Size() (int, error) {
 }
 
 // MetadataSize -  returns size of metadata file
-func (ceres *Ceres) MetadataSize() (int, error) {
+func (ceres *Ceres) MetadataSize() (int64, error) {
 	if ceres.metadataFile == nil {
 		return -1, fmt.Errorf("metadata file is not defined, this shouldn't happen")
 	}
@@ -503,35 +586,27 @@ func (ceres *Ceres) MetadataSize() (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	return int(stat.Size()), nil
+	return stat.Size(), nil
 }
 
 // AggregationMethod - returns string representation of aggregation method
-func (ceres *Ceres) AggregationMethod() string {
-	aggr := "unknown"
-	switch ceres.metadata.AggregationMethod {
-	case Average:
-		aggr = "Average"
-	case Sum:
-		aggr = "Sum"
-	case Last:
-		aggr = "Last"
-	case Max:
-		aggr = "Max"
-	case Min:
-		aggr = "Min"
-	}
-	return aggr
+func (ceres *Ceres) AggregationMethodString() string {
+	return ceres.metadata.AggregationMethod.String()
+}
+
+// AggregationMethod - returns string representation of aggregation method
+func (ceres *Ceres) AggregationMethod() AggregationMethod {
+	return ceres.metadata.AggregationMethod
 }
 
 // MaxRetention - returns max retnetion in seconds
-func (ceres *Ceres) MaxRetention() int {
+func (ceres *Ceres) MaxRetention() int64 {
 	return ceres.metadata.Retentions[0].MaxRetention()
 }
 
 // StartTime - calculate the starting time for a whisper db.
-func (ceres *Ceres) StartTime() int {
-	now := int(ceres.TimeNow().Unix()) // TODO: danger of 2030 something overflow
+func (ceres *Ceres) StartTime() int64 {
+	now := ceres.TimeNow().Unix() // TODO: danger of 2030 something overflow
 	return now - ceres.MaxRetention()
 }
 
@@ -543,6 +618,171 @@ func (ceres *Ceres) XFilesFactor() float32 {
 // Retentions - returns list of retentions for specific path
 func (ceres *Ceres) Retentions() []Retention {
 	return ceres.metadata.Retentions
+}
+
+func isInInterval(archiveIntervalStartTime, archiveIntervalEndTime, intervalStartTime, intervalEndTime int64) bool {
+	return intervalStartTime <= archiveIntervalEndTime && archiveIntervalStartTime <= intervalEndTime
+}
+
+// Fetch a TimeSeries for a given time span from the file.
+func (ceres *Ceres) Fetch(fromTime, untilTime int64) (timeSeries *TimeSeries, err error) {
+	now := ceres.TimeNow().Unix() // TODO: danger of 2030 something overflow
+	if fromTime > untilTime {
+		// TODO: use errors
+		return nil, ErrInvalidFrom
+	}
+	oldestTime := ceres.StartTime()
+	// range is in the future
+	// TODO: think about breaking compatibility and allow to read future datapoints
+	if fromTime > now {
+		return nil, nil
+	}
+	// range is beyond retention
+	if untilTime < oldestTime {
+		return nil, nil
+	}
+	if fromTime < oldestTime {
+		fromTime = oldestTime
+	}
+	if untilTime > now {
+		untilTime = now
+	}
+
+	// Get list of all archives that needs to be read
+	archivesToRead := make([]*CeresSlice, 0)
+	stepTime := int64(-1)
+	for _, archives := range ceres.archives {
+		for _, archive := range archives {
+			archiveStartTime := archive.MinRetention()
+			// Assumption: our start time is wi
+			if archiveStartTime > untilTime {
+				break
+			}
+			archiveStopTime := archive.MaxRetention()
+			if isInInterval(archiveStartTime, archiveStopTime, fromTime, untilTime) {
+				archivesToRead = append(archivesToRead, archive)
+				if archive.Step() > stepTime {
+					stepTime = archive.Step()
+				}
+			}
+		}
+	}
+
+	res := TimeSeries{
+		fromTime:  int(fromTime),
+		untilTime: int(untilTime),
+		step:      int(stepTime),
+		values:    make([]float64, fromTime-untilTime),
+	}
+
+	/*
+		base := fromTime
+		for _, archive := range archivesToRead {
+
+		}
+	*/
+
+	return &res, nil
+
+	/*
+		fromInterval := archive.Interval(fromTime)
+		untilInterval := archive.Interval(untilTime)
+		baseInterval := ceres.getBaseInterval(archive)
+
+		if baseInterval == 0 {
+			step := archive.SecondsPerPoint
+			Points := (untilInterval - fromInterval) / step
+			values := make([]float64, Points)
+			for i := range values {
+				values[i] = math.NaN()
+			}
+			return &TimeSeries{fromInterval, untilInterval, step, values}, nil
+		}
+
+		// Zero-length time range: always include the next point
+		if fromInterval == untilInterval {
+			untilInterval += archive.SecondsPerPoint
+		}
+
+		fromOffset := archive.PointOffset(baseInterval, fromInterval)
+		untilOffset := archive.PointOffset(baseInterval, untilInterval)
+
+		series, err := ceres.readSeries(fromOffset, untilOffset, archive)
+		if err != nil {
+			return nil, err
+		}
+
+		values := make([]float64, len(series))
+		for i := range values {
+			values[i] = math.NaN()
+		}
+		currentInterval := fromInterval
+		step := archive.SecondsPerPoint
+
+		for i, dPoint := range series {
+			if dPoint.interval == currentInterval {
+				values[i] = dPoint.value
+			}
+			currentInterval += step
+		}
+
+		return &TimeSeries{fromInterval, untilInterval, step, values}, nil
+	*/
+}
+
+/*
+
+// CheckEmpty - checks if TimeSeries have a Points for a given time span from the file.
+func (whisper *Ceres) CheckEmpty(fromTime, untilTime int) (exist bool, err error) {
+	now := int(time.Now().Unix()) // TODO: danger of 2030 something overflow
+	if fromTime > untilTime {
+		return true, fmt.Errorf("Invalid time interval: from time '%d' is after until time '%d'", fromTime, untilTime)
+	}
+	oldestTime := whisper.StartTime()
+	// range is in the future
+	if fromTime > now {
+		return true, nil
+	}
+	// range is beyond retention
+	if untilTime < oldestTime {
+		return true, nil
+	}
+	if fromTime < oldestTime {
+		fromTime = oldestTime
+	}
+	if untilTime > now {
+		untilTime = now
+	}
+
+	// TODO: improve this algorithm it's ugly
+	diff := now - fromTime
+	var archive *archiveInfo
+	for _, archive = range whisper.archives {
+		fromInterval := archive.Interval(fromTime)
+		untilInterval := archive.Interval(untilTime)
+		baseInterval := whisper.getBaseInterval(archive)
+
+		if baseInterval == 0 {
+			return true, nil
+		}
+
+		// Zero-length time range: always include the next point
+		if fromInterval == untilInterval {
+			untilInterval += archive.SecondsPerPoint()
+		}
+
+		fromOffset := archive.PointOffset(baseInterval, fromInterval)
+		untilOffset := archive.PointOffset(baseInterval, untilInterval)
+
+		empty, err := whisper.checkSeriesEmpty(fromOffset, untilOffset, archive, fromTime, untilTime)
+		if err != nil || !empty {
+			return empty, err
+		}
+		if archive.MaxRetention() >= diff {
+			break
+		}
+	}
+	return true, nil
 }
 
 /*
@@ -868,134 +1108,6 @@ func (whisper *Ceres) checkSeriesEmptyAt(start, len int64, fromTime, untilTime i
 	return true, nil
 }
 
-// Fetch a TimeSeries for a given time span from the file.
-func (whisper *Ceres) Fetch(fromTime, untilTime int) (timeSeries *TimeSeries, err error) {
-	now := int(time.Now().Unix()) // TODO: danger of 2030 something overflow
-	if fromTime > untilTime {
-		return nil, fmt.Errorf("Invalid time interval: from time '%d' is after until time '%d'", fromTime, untilTime)
-	}
-	oldestTime := whisper.StartTime()
-	// range is in the future
-	if fromTime > now {
-		return nil, nil
-	}
-	// range is beyond retention
-	if untilTime < oldestTime {
-		return nil, nil
-	}
-	if fromTime < oldestTime {
-		fromTime = oldestTime
-	}
-	if untilTime > now {
-		untilTime = now
-	}
-
-	// TODO: improve this algorithm it's ugly
-	diff := now - fromTime
-	var archive *archiveInfo
-	for _, archive = range whisper.archives {
-		if archive.MaxRetention() >= diff {
-			break
-		}
-	}
-
-	fromInterval := archive.Interval(fromTime)
-	untilInterval := archive.Interval(untilTime)
-	baseInterval := whisper.getBaseInterval(archive)
-
-	if baseInterval == 0 {
-		step := archive.SecondsPerPoint
-		Points := (untilInterval - fromInterval) / step
-		values := make([]float64, Points)
-		for i := range values {
-			values[i] = math.NaN()
-		}
-		return &TimeSeries{fromInterval, untilInterval, step, values}, nil
-	}
-
-	// Zero-length time range: always include the next point
-	if fromInterval == untilInterval {
-		untilInterval += archive.SecondsPerPoint()
-	}
-
-	fromOffset := archive.PointOffset(baseInterval, fromInterval)
-	untilOffset := archive.PointOffset(baseInterval, untilInterval)
-
-	series, err := whisper.readSeries(fromOffset, untilOffset, archive)
-	if err != nil {
-		return nil, err
-	}
-
-	values := make([]float64, len(series))
-	for i := range values {
-		values[i] = math.NaN()
-	}
-	currentInterval := fromInterval
-	step := archive.SecondsPerPoint
-
-	for i, dPoint := range series {
-		if dPoint.interval == currentInterval {
-			values[i] = dPoint.value
-		}
-		currentInterval += step
-	}
-
-	return &TimeSeries{fromInterval, untilInterval, step, values}, nil
-}
-
-// CheckEmpty - checks if TimeSeries have a Points for a given time span from the file.
-func (whisper *Ceres) CheckEmpty(fromTime, untilTime int) (exist bool, err error) {
-	now := int(time.Now().Unix()) // TODO: danger of 2030 something overflow
-	if fromTime > untilTime {
-		return true, fmt.Errorf("Invalid time interval: from time '%d' is after until time '%d'", fromTime, untilTime)
-	}
-	oldestTime := whisper.StartTime()
-	// range is in the future
-	if fromTime > now {
-		return true, nil
-	}
-	// range is beyond retention
-	if untilTime < oldestTime {
-		return true, nil
-	}
-	if fromTime < oldestTime {
-		fromTime = oldestTime
-	}
-	if untilTime > now {
-		untilTime = now
-	}
-
-	// TODO: improve this algorithm it's ugly
-	diff := now - fromTime
-	var archive *archiveInfo
-	for _, archive = range whisper.archives {
-		fromInterval := archive.Interval(fromTime)
-		untilInterval := archive.Interval(untilTime)
-		baseInterval := whisper.getBaseInterval(archive)
-
-		if baseInterval == 0 {
-			return true, nil
-		}
-
-		// Zero-length time range: always include the next point
-		if fromInterval == untilInterval {
-			untilInterval += archive.SecondsPerPoint()
-		}
-
-		fromOffset := archive.PointOffset(baseInterval, fromInterval)
-		untilOffset := archive.PointOffset(baseInterval, untilInterval)
-
-		empty, err := whisper.checkSeriesEmpty(fromOffset, untilOffset, archive, fromTime, untilTime)
-		if err != nil || !empty {
-			return empty, err
-		}
-		if archive.MaxRetention() >= diff {
-			break
-		}
-	}
-	return true, nil
-}
-
 func (whisper *Ceres) readInt(offset int64) (int, error) {
 	// TODO: make errors better
 	b := make([]byte, IntSize)
@@ -1005,46 +1117,6 @@ func (whisper *Ceres) readInt(offset int64) (int, error) {
 	}
 
 	return unpackInt(b), nil
-}
-
-type TimeSeries struct {
-	fromTime  int
-	untilTime int
-	step      int
-	values    []float64
-}
-
-func (ts *TimeSeries) FromTime() int {
-	return ts.fromTime
-}
-
-func (ts *TimeSeries) UntilTime() int {
-	return ts.untilTime
-}
-
-func (ts *TimeSeries) Step() int {
-	return ts.step
-}
-
-func (ts *TimeSeries) Values() []float64 {
-	return ts.values
-}
-
-func (ts *TimeSeries) Points() []TimeSeriesPoint {
-	Points := make([]TimeSeriesPoint, len(ts.values))
-	for i, value := range ts.values {
-		Points[i] = TimeSeriesPoint{Time: ts.fromTime + ts.step*i, Value: value}
-	}
-	return Points
-}
-
-func (ts *TimeSeries) String() string {
-	return fmt.Sprintf("TimeSeries{'%v' '%-v' %v %v}", time.Unix(int64(ts.fromTime), 0), time.Unix(int64(ts.untilTime), 0), ts.step, ts.values)
-}
-
-type TimeSeriesPoint struct {
-	Time  int
-	Value float64
 }
 
 type timeSeriesPoints []*TimeSeriesPoint
@@ -1075,42 +1147,6 @@ func (point *dataPoint) Bytes() []byte {
 	packInt(b, point.interval, 0)
 	packFloat64(b, point.value, IntSize)
 	return b
-}
-
-func sum(values []float64) float64 {
-	result := 0.0
-	for _, value := range values {
-		result += value
-	}
-	return result
-}
-
-func aggregate(method AggregationMethod, knownValues []float64) float64 {
-	switch method {
-	case Average:
-		return sum(knownValues) / float64(len(knownValues))
-	case Sum:
-		return sum(knownValues)
-	case Last:
-		return knownValues[len(knownValues)-1]
-	case Max:
-		max := knownValues[0]
-		for _, value := range knownValues {
-			if value > max {
-				max = value
-			}
-		}
-		return max
-	case Min:
-		min := knownValues[0]
-		for _, value := range knownValues {
-			if value < min {
-				min = value
-			}
-		}
-		return min
-	}
-	panic("Invalid aggregation method")
 }
 
 func packInt(b []byte, v, i int) int {
